@@ -1,117 +1,168 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from ta.trend import EMAIndicator, SMAIndicator, MACD
 from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator, MACD
-from ta.volatility import AverageTrueRange
-import time
+from ta.volatility import BollingerBands
+from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Multi Asset AI Trading Bot", layout="wide")
-
-# ===== SYMBOL LIST =====
-SYMBOLS = {
-    "Gold (XAUUSD)": "GC=F",
-    "Silver": "SI=F",
-    "Bitcoin": "BTC-USD",
-    "Ethereum": "ETH-USD",
-    "EUR/USD": "EURUSD=X",
-    "GBP/USD": "GBPUSD=X",
-    "USD/JPY": "JPY=X",
-    "AUD/USD": "AUDUSD=X",
-    "Crude Oil": "CL=F",
-    "Nasdaq": "^IXIC"
-}
-
-MIN_RR = 2
-
-st.title("💀 Multi Currency AI Trading Bot")
-st.write("Live AI Signals using Yahoo Finance")
+st.set_page_config(page_title="MarketMind AI", layout="wide")
+st.title(" MarketMind AI ")
 
 # ===== SIDEBAR =====
-symbol_name = st.sidebar.selectbox("Select Trading Asset", list(SYMBOLS.keys()))
-SYMBOL = SYMBOLS[symbol_name]
+with st.sidebar:
+    st.header("⚙ Trading Settings")
 
-capital = st.sidebar.number_input("Capital ($)", value=100)
-risk_percent = st.sidebar.slider("Risk % per Trade", 1, 10, 2)
+    symbols = {
+        "Gold (XAUUSD)": "GC=F",
+        "Silver": "SI=F",
+        "BTC/USD": "BTC-USD",
+        "ETH/USD": "ETH-USD",
+        "EUR/USD": "EURUSD=X",
+        "GBP/USD": "GBPUSD=X",
+        "NASDAQ": "^IXIC",
+        "S&P500": "^GSPC"
+    }
 
-st.sidebar.markdown("---")
-st.sidebar.write("Selected Symbol:")
-st.sidebar.success(symbol_name)
+    asset = st.selectbox("Select Asset", list(symbols.keys()))
+    symbol = symbols[asset]
 
-# ===== DATA =====
-def get_data():
-    df = yf.download(SYMBOL, period="1d", interval="5m", progress=False)
+    tf = st.selectbox("Timeframe", ["1m","5m","15m","1h","1d"])
+    capital = st.number_input("Capital ($)", value=100)
+    risk = st.slider("Risk %",1,10,2)
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    refresh = st.selectbox("Auto Refresh", ["Off","10s","30s"])
+    if refresh!="Off":
+        sec={"10s":10,"30s":30}[refresh]
+        st_autorefresh(interval=sec*1000,key="refresh")
 
-    df['rsi'] = RSIIndicator(df['Close']).rsi()
-    df['ema20'] = EMAIndicator(df['Close'], 20).ema_indicator()
-    df['ema50'] = EMAIndicator(df['Close'], 50).ema_indicator()
+# ===== DATA FETCH =====
+period_map={
+"1m":"1d","5m":"5d","15m":"15d","1h":"60d","1d":"1y"
+}
 
-    macd = MACD(df['Close'])
-    df['macd'] = macd.macd_diff()
+df = yf.download(symbol, period=period_map[tf], interval=tf, progress=False)
 
-    df['atr'] = AverageTrueRange(
-        df['High'], df['Low'], df['Close']
-    ).average_true_range()
+# ===== EMPTY DATA FIX =====
+if df is None or df.empty:
+    st.error("No market data available for the selected asset and timeframe.")
+    st.stop()
 
-    df.dropna(inplace=True)
-    return df
+if isinstance(df.columns, pd.MultiIndex):
+    df.columns = df.columns.get_level_values(0)
 
-# ===== SIGNAL LOGIC =====
-def signal(df):
-    last = df.iloc[-1]
+df = df.dropna()
 
-    price = float(last['Close'])
-    atr = float(last['atr'])
+if df.empty or len(df)<50:
+    st.warning("Data loading...")
+    st.stop()
 
-    sig = "HOLD"
-    sl = tp = rr = 0
+close=df["Close"]
 
-    # BUY
-    if price > last['ema20'] and last['rsi'] > 50 and last['macd'] > 0:
-        sl = price - atr * 1.2
-        tp = price + atr * 2.5
-        rr = abs(tp - price) / abs(price - sl)
-        if rr >= MIN_RR:
-            sig = "BUY"
+# ===== INDICATORS =====
+df["EMA20"]=EMAIndicator(close,20).ema_indicator()
+df["SMA50"]=SMAIndicator(close,50).sma_indicator()
+df["RSI"]=RSIIndicator(close).rsi()
 
-    # SELL
-    if price < last['ema20'] and last['rsi'] < 50 and last['macd'] < 0:
-        sl = price + atr * 1.2
-        tp = price - atr * 2.5
-        rr = abs(price - tp) / abs(price - sl)
-        if rr >= MIN_RR:
-            sig = "SELL"
+macd=MACD(close)
+df["MACD"]=macd.macd()
+df["MACD_signal"]=macd.macd_signal()
 
-    lot = (capital * (risk_percent / 100)) / (abs(price - sl) * 100) if sig != "HOLD" else 0
-    lot = round(max(lot, 0.01), 2)
+bb=BollingerBands(close)
+df["BB_up"]=bb.bollinger_hband()
+df["BB_low"]=bb.bollinger_lband()
 
-    return sig, price, sl, tp, lot, rr
+last=df.iloc[-1]
 
-# ===== LIVE DISPLAY =====
-placeholder = st.empty()
+# ===== AI SIGNAL =====
+score=0
+if last["RSI"]<30: score+=2
+if last["RSI"]>70: score-=2
+if last["MACD"]>last["MACD_signal"]: score+=2
+else: score-=2
+if last["EMA20"]>last["SMA50"]: score+=1
+else: score-=1
 
-while True:
-    df = get_data()
-    sig, price, sl, tp, lot, rr = signal(df)
+if score>=3:
+    signal="STRONG BUY"
+elif score<=-3:
+    signal="STRONG SELL"
+elif score>0:
+    signal="BUY"
+elif score<0:
+    signal="SELL"
+else:
+    signal="WAIT"
 
-    with placeholder.container():
-        col1, col2, col3, col4 = st.columns(4)
+# ===== SUPPORT / RESIST =====
+support=df["Low"].tail(50).min()
+resistance=df["High"].tail(50).max()
 
-        col1.metric("Price", round(price, 2))
-        col2.metric("Signal", sig)
-        col3.metric("Risk/Reward", f"1:{round(rr, 2)}")
-        col4.metric("Lot Size", lot)
+# ===== RR + LOT =====
+atr=(df["High"]-df["Low"]).rolling(14).mean().iloc[-1]
+sl=last["Close"]-atr*1.2
+tp=last["Close"]+atr*2.5
+rr=abs(tp-last["Close"])/abs(last["Close"]-sl)
 
-        if sig != "HOLD":
-            st.success(f" TRADE SIGNAL: {sig}")
-            st.write(f" Take Profit: {round(tp, 2)}")
-            st.write(f"Stop Loss: {round(sl, 2)}")
-        else:
-            st.warning("No Trade Zone")
+lot=(capital*(risk/100))/(abs(last["Close"]-sl)*100)
+lot=round(max(lot,0.01),2)
 
-        st.line_chart(df['Close'])
+# ===== TOP PANEL =====
+c1,c2,c3,c4,c5=st.columns(5)
+c1.metric("Price",round(last["Close"],2))
+c2.metric("RSI",round(last["RSI"],1))
+c3.metric("AI Signal",signal)
+c4.metric("Risk/Reward",f"1:{round(rr,2)}")
+c5.metric("Lot Size",lot)
 
-    time.sleep(5)
+st.success(f"AI Signal → {signal}")
+
+# ===== CHART =====
+fig = make_subplots(
+    rows=3, cols=1,
+    shared_xaxes=True,
+    vertical_spacing=0.03,
+    row_heights=[0.6,0.2,0.2]
+)
+
+# Candle
+fig.add_trace(go.Candlestick(
+    x=df.index,
+    open=df["Open"],
+    high=df["High"],
+    low=df["Low"],
+    close=df["Close"],
+    name="Price"
+),row=1,col=1)
+
+# EMA SMA
+fig.add_trace(go.Scatter(x=df.index,y=df["EMA20"],name="EMA20"),row=1,col=1)
+fig.add_trace(go.Scatter(x=df.index,y=df["SMA50"],name="SMA50"),row=1,col=1)
+
+# Bollinger
+fig.add_trace(go.Scatter(x=df.index,y=df["BB_up"],line=dict(width=1)),row=1,col=1)
+fig.add_trace(go.Scatter(x=df.index,y=df["BB_low"],fill='tonexty',line=dict(width=1)),row=1,col=1)
+
+# Support Resistance
+fig.add_hline(y=support,line_dash="dot",line_color="green")
+fig.add_hline(y=resistance,line_dash="dot",line_color="red")
+
+# MACD
+fig.add_trace(go.Scatter(x=df.index,y=df["MACD"],name="MACD"),row=2,col=1)
+fig.add_trace(go.Scatter(x=df.index,y=df["MACD_signal"],name="Signal"),row=2,col=1)
+
+# RSI
+fig.add_trace(go.Scatter(x=df.index,y=df["RSI"],name="RSI"),row=3,col=1)
+fig.add_hline(y=70,row=3,col=1,line_dash="dash")
+fig.add_hline(y=30,row=3,col=1,line_dash="dash")
+
+fig.update_layout(
+height=850,
+template="plotly_dark",
+xaxis_rangeslider_visible=False,
+title=f"{asset} AI Trading Terminal"
+)
+
+st.plotly_chart(fig,use_container_width=True)
