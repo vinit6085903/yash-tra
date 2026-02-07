@@ -4,3 +4,5 @@ pandas
 ta
 numpy
 streamlit-autorefresh
+plotly
+scikit-learn
